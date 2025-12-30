@@ -12,16 +12,18 @@
 obj-m := pagewalk_driver.o
 
 # Kernel build directory - override with KDIR=/path/to/kernel
+# For cross-compilation, pass KDIR from top-level Makefile
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 # Current directory
 PWD := $(shell pwd)
 
 # Cross compiler prefix (empty for native build)
+# For i.MX8MP: CROSS_COMPILE=aarch64-poky-linux-
 CROSS_COMPILE ?=
 
-# Architecture (auto-detect or override)
-ARCH ?= $(shell uname -m | sed 's/aarch64/arm64/' | sed 's/x86_64/x86/')
+# Architecture (arm64 for i.MX8MP, auto-detect for native)
+ARCH ?= arm64
 
 # Extra compiler flags
 ccflags-y := -I$(PWD)/../include

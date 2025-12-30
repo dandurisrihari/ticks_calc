@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * pagewalk_driver.c - Kernel driver for measuring pagewalk timing and interrupt latency
+ * pagewalk_driver.c - Kernel driver for precise pagewalk timing measurement
  *
- * This driver provides:
- * 1. Synchronous pagewalk timing measurement
- * 2. Interrupt-triggered pagewalk timing (using hrtimer)
- * 3. Statistics collection for multiple samples
+ * Simple driver that:
+ * 1. Takes a PID and virtual address from userspace
+ * 2. Walks the page table to check validity
+ * 3. Returns physical address and precise cycle count measurement
  *
- * Usage: Load module, then use ioctl via /dev/pagewalk_timer
+ * Uses ARM64 cycle counter (PMCCNTR_EL0) for precise timing
  */
 
 #include <linux/module.h>
@@ -22,37 +22,57 @@
 #include <linux/pid.h>
 #include <linux/pgtable.h>
 #include <linux/ktime.h>
-#include <linux/hrtimer.h>
-#include <linux/spinlock.h>
-#include <linux/wait.h>
-#include <linux/slab.h>
-#include <linux/highmem.h>
 
 #include "../include/pagewalk_ioctl.h"
 
 #define DRIVER_NAME     "pagewalk_timer"
-#define DRIVER_VERSION  "1.0"
-
-/* Per-file private data */
-struct pagewalk_context {
-    pid_t target_pid;
-    unsigned long target_vaddr;
-    struct pagewalk_result last_result;
-    struct interrupt_timing irq_timing;
-    struct hrtimer timer;
-    wait_queue_head_t wait_queue;
-    spinlock_t lock;
-    bool measurement_pending;
-    bool measurement_complete;
-};
+#define DRIVER_VERSION  "2.0"
 
 /*
- * Perform manual page table walk
- * Returns: validity code (ADDR_VALID on success, ADDR_INVALID_* on failure)
- * Sets *paddr to physical address if valid
+ * ARM64 cycle counter access
+ * Enable and read the CPU cycle counter for precise timing
  */
-static int do_pagewalk(struct mm_struct *mm, unsigned long vaddr, 
-                       unsigned long *paddr, u64 *walk_time_ns)
+#ifdef CONFIG_ARM64
+
+static inline void enable_cycle_counter(void)
+{
+    u64 val;
+    
+    /* Enable user-space access to cycle counter (for completeness) */
+    asm volatile("mrs %0, pmuserenr_el0" : "=r" (val));
+    val |= (1 << 0) | (1 << 2);  /* EN | CR */
+    asm volatile("msr pmuserenr_el0, %0" : : "r" (val));
+    
+    /* Enable cycle counter */
+    asm volatile("mrs %0, pmcntenset_el0" : "=r" (val));
+    val |= (1UL << 31);  /* Enable PMCCNTR_EL0 */
+    asm volatile("msr pmcntenset_el0, %0" : : "r" (val));
+    
+    /* Configure PMCR: enable, reset cycle counter */
+    asm volatile("mrs %0, pmcr_el0" : "=r" (val));
+    val |= (1 << 0) | (1 << 2);  /* E | C */
+    asm volatile("msr pmcr_el0, %0" : : "r" (val));
+}
+
+static inline u64 read_cycle_counter(void)
+{
+    u64 val;
+    isb();  /* Instruction barrier for accurate timing */
+    asm volatile("mrs %0, pmccntr_el0" : "=r" (val));
+    return val;
+}
+
+#else
+/* Fallback for non-ARM64 - use ktime */
+static inline void enable_cycle_counter(void) {}
+static inline u64 read_cycle_counter(void) { return ktime_get_ns(); }
+#endif
+
+/*
+ * Perform page table walk with precise cycle timing
+ */
+static int do_pagewalk(struct mm_struct *mm, unsigned long vaddr,
+                       struct pagewalk_request *req)
 {
     pgd_t *pgd;
     p4d_t *p4d;
@@ -60,289 +80,153 @@ static int do_pagewalk(struct mm_struct *mm, unsigned long vaddr,
     pmd_t *pmd;
     pte_t *pte;
     unsigned long pfn;
+    u64 start_cycles, end_cycles;
     u64 start_ns, end_ns;
     int result = ADDR_VALID;
 
-    *paddr = 0;
+    req->paddr = 0;
+    req->is_huge_page = 0;
     
+    /* Get both cycle count and nanoseconds for comparison */
     start_ns = ktime_get_ns();
+    start_cycles = read_cycle_counter();
 
-    /* Walk the page table hierarchy */
+    /* ============ PAGE TABLE WALK START ============ */
+    
+    /* Level 0: PGD (Page Global Directory) */
     pgd = pgd_offset(mm, vaddr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) {
         result = ADDR_INVALID_PGD;
         goto out;
     }
 
+    /* Level 1: P4D (only on 5-level paging, pass-through on 4-level) */
     p4d = p4d_offset(pgd, vaddr);
     if (p4d_none(*p4d) || p4d_bad(*p4d)) {
         result = ADDR_INVALID_P4D;
         goto out;
     }
 
+    /* Level 2: PUD (Page Upper Directory) */
     pud = pud_offset(p4d, vaddr);
     if (pud_none(*pud) || pud_bad(*pud)) {
         result = ADDR_INVALID_PUD;
         goto out;
     }
 
+    /* Level 3: PMD (Page Middle Directory) */
     pmd = pmd_offset(pud, vaddr);
     if (pmd_none(*pmd)) {
         result = ADDR_INVALID_PMD;
         goto out;
     }
 
-    /* Check for huge page (2MB) */
+    /* Check for huge page (2MB section on ARM64) */
+#ifdef CONFIG_ARM64
+    if (pmd_sect(*pmd)) {
+#else
     if (pmd_large(*pmd)) {
+#endif
         if (!pmd_present(*pmd)) {
             result = ADDR_NOT_PRESENT;
             goto out;
         }
         pfn = pmd_pfn(*pmd);
-        *paddr = (pfn << PAGE_SHIFT) | (vaddr & ~PMD_MASK);
+        req->paddr = (pfn << PAGE_SHIFT) | (vaddr & ~PMD_MASK);
+        req->is_huge_page = 1;
         goto out;
     }
 
-    pte = pte_offset_map(pmd, vaddr);
-    if (!pte) {
-        result = ADDR_INVALID_PTE;
-        goto out;
-    }
-
-    if (pte_none(*pte)) {
-        pte_unmap(pte);
+    /* Level 4: PTE (Page Table Entry) - 4KB pages */
+    pte = pte_offset_kernel(pmd, vaddr);
+    if (!pte || pte_none(*pte)) {
         result = ADDR_INVALID_PTE;
         goto out;
     }
 
     if (!pte_present(*pte)) {
-        pte_unmap(pte);
         result = ADDR_NOT_PRESENT;
         goto out;
     }
 
     /* Extract physical address */
     pfn = pte_pfn(*pte);
-    *paddr = (pfn << PAGE_SHIFT) | (vaddr & ~PAGE_MASK);
-    pte_unmap(pte);
+    req->paddr = (pfn << PAGE_SHIFT) | (vaddr & ~PAGE_MASK);
+
+    /* ============ PAGE TABLE WALK END ============ */
 
 out:
+    end_cycles = read_cycle_counter();
     end_ns = ktime_get_ns();
-    *walk_time_ns = end_ns - start_ns;
-    return result;
+    
+    req->walk_cycles = end_cycles - start_cycles;
+    req->walk_ns = end_ns - start_ns;
+    req->valid = result;
+    
+    return 0;
 }
 
 /*
- * Perform pagewalk for a given PID and virtual address
+ * Main pagewalk function - looks up process and performs walk
  */
-static int pagewalk_for_pid(pid_t pid, unsigned long vaddr,
-                           struct pagewalk_result *result)
+static int pagewalk_for_pid(struct pagewalk_request *req)
 {
     struct task_struct *task;
     struct mm_struct *mm;
-    unsigned long paddr = 0;
-    u64 walk_time_ns = 0;
-    int validity;
+    int ret;
 
-    result->vaddr = vaddr;
-    result->paddr = 0;
-    result->valid = ADDR_PROCESS_NOT_FOUND;
-    result->pagewalk_time_ns = 0;
+    req->valid = ADDR_PROCESS_NOT_FOUND;
+    req->paddr = 0;
+    req->walk_cycles = 0;
+    req->walk_ns = 0;
 
-    /* Find the task by PID */
+    /* Find the target process */
     rcu_read_lock();
-    task = pid_task(find_vpid(pid), PIDTYPE_PID);
+    task = pid_task(find_vpid(req->pid), PIDTYPE_PID);
     if (!task) {
         rcu_read_unlock();
         return -ESRCH;
     }
     
-    /* Get mm_struct (increments refcount) */
+    /* Get mm_struct with reference */
     mm = get_task_mm(task);
     rcu_read_unlock();
 
     if (!mm) {
-        result->valid = ADDR_NO_MM;
+        req->valid = ADDR_NO_MM;
         return -EINVAL;
     }
 
-    /* Lock mm for reading */
+    /* Lock mm and perform pagewalk */
     mmap_read_lock(mm);
-    
-    /* Perform the pagewalk */
-    validity = do_pagewalk(mm, vaddr, &paddr, &walk_time_ns);
-    
+    ret = do_pagewalk(mm, req->vaddr, req);
     mmap_read_unlock(mm);
+    
     mmput(mm);
-
-    result->valid = validity;
-    result->paddr = paddr;
-    result->pagewalk_time_ns = walk_time_ns;
-
-    return 0;
+    return ret;
 }
 
 /*
- * hrtimer callback - simulates interrupt handler
- * This runs in hard IRQ context
+ * IOCTL handler
  */
-static enum hrtimer_restart pagewalk_timer_callback(struct hrtimer *timer)
+static long pagewalk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    struct pagewalk_context *ctx = container_of(timer, struct pagewalk_context, timer);
-    struct task_struct *task;
-    struct mm_struct *mm;
-    unsigned long paddr = 0;
-    u64 walk_time_ns = 0;
-    unsigned long flags;
-
-    /* Record handler entry time */
-    ctx->irq_timing.handler_entry_ns = ktime_get_ns();
-
-    spin_lock_irqsave(&ctx->lock, flags);
-
-    /* Find task and get mm */
-    rcu_read_lock();
-    task = pid_task(find_vpid(ctx->target_pid), PIDTYPE_PID);
-    if (!task) {
-        ctx->irq_timing.valid = ADDR_PROCESS_NOT_FOUND;
-        rcu_read_unlock();
-        goto out;
-    }
-    
-    mm = get_task_mm(task);
-    rcu_read_unlock();
-
-    if (!mm) {
-        ctx->irq_timing.valid = ADDR_NO_MM;
-        goto out;
-    }
-
-    /* Note: In real interrupt context, we shouldn't hold mm locks
-     * For this measurement, we use hrtimer which can be configured
-     * to run in softirq context. The mm lock is safe in that context.
-     */
-    ctx->irq_timing.pagewalk_start_ns = ktime_get_ns();
-    
-    if (mmap_read_trylock(mm)) {
-        ctx->irq_timing.valid = do_pagewalk(mm, ctx->target_vaddr, &paddr, &walk_time_ns);
-        mmap_read_unlock(mm);
-    } else {
-        ctx->irq_timing.valid = ADDR_NO_MM; /* Could not acquire lock */
-    }
-    
-    ctx->irq_timing.pagewalk_end_ns = ktime_get_ns();
-    mmput(mm);
-
-out:
-    ctx->irq_timing.handler_exit_ns = ktime_get_ns();
-    
-    /* Calculate latencies */
-    ctx->irq_timing.interrupt_latency_ns = 
-        ctx->irq_timing.handler_entry_ns - ctx->irq_timing.trigger_time_ns;
-    ctx->irq_timing.total_latency_ns = 
-        ctx->irq_timing.handler_exit_ns - ctx->irq_timing.trigger_time_ns;
-
-    ctx->measurement_complete = true;
-    ctx->measurement_pending = false;
-    
-    spin_unlock_irqrestore(&ctx->lock, flags);
-    
-    wake_up_interruptible(&ctx->wait_queue);
-
-    return HRTIMER_NORESTART;
-}
-
-/*
- * Trigger interrupt-based measurement
- */
-static int trigger_interrupt_measurement(struct pagewalk_context *ctx)
-{
-    unsigned long flags;
-    ktime_t delay;
-
-    spin_lock_irqsave(&ctx->lock, flags);
-    
-    if (ctx->measurement_pending) {
-        spin_unlock_irqrestore(&ctx->lock, flags);
-        return -EBUSY;
-    }
-
-    ctx->measurement_pending = true;
-    ctx->measurement_complete = false;
-    
-    /* Clear previous timing data */
-    memset(&ctx->irq_timing, 0, sizeof(ctx->irq_timing));
-    
-    /* Record trigger time */
-    ctx->irq_timing.trigger_time_ns = ktime_get_ns();
-    
-    spin_unlock_irqrestore(&ctx->lock, flags);
-
-    /* Schedule timer to fire in 1 microsecond */
-    delay = ktime_set(0, 1000); /* 1 microsecond */
-    hrtimer_start(&ctx->timer, delay, HRTIMER_MODE_REL);
-
-    return 0;
-}
-
-/*
- * Run multiple measurements and collect statistics
- */
-static int run_statistics(struct pagewalk_context *ctx, struct pagewalk_stats *stats)
-{
-    struct pagewalk_result result;
-    u64 total_pagewalk = 0;
-    u64 total_irq = 0;
-    u32 count = stats->sample_count;
-    u32 i;
+    struct pagewalk_request req;
     int ret;
 
-    if (count == 0 || count > 1000)
-        count = 10; /* Default to 10 samples */
+    if (cmd != PAGEWALK_CHECK)
+        return -ENOTTY;
 
-    stats->min_pagewalk_ns = ULLONG_MAX;
-    stats->max_pagewalk_ns = 0;
-    stats->min_irq_latency_ns = ULLONG_MAX;
-    stats->max_irq_latency_ns = 0;
+    if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+        return -EFAULT;
 
-    for (i = 0; i < count; i++) {
-        /* Synchronous pagewalk measurement */
-        ret = pagewalk_for_pid(ctx->target_pid, ctx->target_vaddr, &result);
-        if (ret)
-            continue;
+    ret = pagewalk_for_pid(&req);
+    
+    /* Always copy back results (even on error, timing may be useful) */
+    if (copy_to_user((void __user *)arg, &req, sizeof(req)))
+        return -EFAULT;
 
-        total_pagewalk += result.pagewalk_time_ns;
-        
-        if (result.pagewalk_time_ns < stats->min_pagewalk_ns)
-            stats->min_pagewalk_ns = result.pagewalk_time_ns;
-        if (result.pagewalk_time_ns > stats->max_pagewalk_ns)
-            stats->max_pagewalk_ns = result.pagewalk_time_ns;
-
-        /* Interrupt-based measurement */
-        ret = trigger_interrupt_measurement(ctx);
-        if (ret)
-            continue;
-
-        /* Wait for measurement to complete */
-        wait_event_interruptible_timeout(ctx->wait_queue, 
-                                         ctx->measurement_complete, 
-                                         msecs_to_jiffies(100));
-
-        if (ctx->measurement_complete) {
-            total_irq += ctx->irq_timing.interrupt_latency_ns;
-            
-            if (ctx->irq_timing.interrupt_latency_ns < stats->min_irq_latency_ns)
-                stats->min_irq_latency_ns = ctx->irq_timing.interrupt_latency_ns;
-            if (ctx->irq_timing.interrupt_latency_ns > stats->max_irq_latency_ns)
-                stats->max_irq_latency_ns = ctx->irq_timing.interrupt_latency_ns;
-        }
-    }
-
-    stats->sample_count = count;
-    stats->avg_pagewalk_ns = count ? total_pagewalk / count : 0;
-    stats->avg_irq_latency_ns = count ? total_irq / count : 0;
-
-    return 0;
+    return ret;
 }
 
 /*
@@ -350,145 +234,14 @@ static int run_statistics(struct pagewalk_context *ctx, struct pagewalk_stats *s
  */
 static int pagewalk_open(struct inode *inode, struct file *file)
 {
-    struct pagewalk_context *ctx;
-
-    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-    if (!ctx)
-        return -ENOMEM;
-
-    spin_lock_init(&ctx->lock);
-    init_waitqueue_head(&ctx->wait_queue);
-    
-    hrtimer_init(&ctx->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-    ctx->timer.function = pagewalk_timer_callback;
-
-    file->private_data = ctx;
-    
-    pr_info(DRIVER_NAME ": device opened\n");
+    /* Enable cycle counter on open */
+    enable_cycle_counter();
     return 0;
 }
 
 static int pagewalk_release(struct inode *inode, struct file *file)
 {
-    struct pagewalk_context *ctx = file->private_data;
-
-    if (ctx) {
-        hrtimer_cancel(&ctx->timer);
-        kfree(ctx);
-    }
-
-    pr_info(DRIVER_NAME ": device closed\n");
     return 0;
-}
-
-static long pagewalk_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-    struct pagewalk_context *ctx = file->private_data;
-    void __user *argp = (void __user *)arg;
-    int ret = 0;
-
-    switch (cmd) {
-    case PAGEWALK_SET_PID: {
-        __s32 pid;
-        if (copy_from_user(&pid, argp, sizeof(pid)))
-            return -EFAULT;
-        ctx->target_pid = pid;
-        pr_debug(DRIVER_NAME ": set target PID to %d\n", pid);
-        break;
-    }
-
-    case PAGEWALK_SET_ADDR: {
-        __u64 addr;
-        if (copy_from_user(&addr, argp, sizeof(addr)))
-            return -EFAULT;
-        ctx->target_vaddr = addr;
-        pr_debug(DRIVER_NAME ": set target address to 0x%llx\n", addr);
-        break;
-    }
-
-    case PAGEWALK_CHECK: {
-        struct pagewalk_result result;
-        
-        ret = pagewalk_for_pid(ctx->target_pid, ctx->target_vaddr, &result);
-        if (ret)
-            return ret;
-        
-        ctx->last_result = result;
-        
-        if (copy_to_user(argp, &result, sizeof(result)))
-            return -EFAULT;
-        break;
-    }
-
-    case PAGEWALK_TRIGGER_IRQ:
-        ret = trigger_interrupt_measurement(ctx);
-        break;
-
-    case PAGEWALK_GET_IRQ_TIMING: {
-        unsigned long flags;
-        struct interrupt_timing timing;
-
-        /* Wait for measurement if pending */
-        if (ctx->measurement_pending) {
-            ret = wait_event_interruptible_timeout(ctx->wait_queue,
-                                                   ctx->measurement_complete,
-                                                   msecs_to_jiffies(1000));
-            if (ret == 0)
-                return -ETIMEDOUT;
-            if (ret < 0)
-                return ret;
-        }
-
-        spin_lock_irqsave(&ctx->lock, flags);
-        timing = ctx->irq_timing;
-        spin_unlock_irqrestore(&ctx->lock, flags);
-
-        if (copy_to_user(argp, &timing, sizeof(timing)))
-            return -EFAULT;
-        break;
-    }
-
-    case PAGEWALK_RUN_STATS: {
-        struct pagewalk_stats stats;
-        
-        if (copy_from_user(&stats, argp, sizeof(stats)))
-            return -EFAULT;
-        
-        ret = run_statistics(ctx, &stats);
-        if (ret)
-            return ret;
-        
-        if (copy_to_user(argp, &stats, sizeof(stats)))
-            return -EFAULT;
-        break;
-    }
-
-    case PAGEWALK_CHECK_FULL: {
-        struct pagewalk_request req;
-        struct pagewalk_result result;
-
-        if (copy_from_user(&req, argp, sizeof(req)))
-            return -EFAULT;
-
-        ctx->target_pid = req.pid;
-        ctx->target_vaddr = req.vaddr;
-
-        ret = pagewalk_for_pid(req.pid, req.vaddr, &result);
-        if (ret)
-            return ret;
-
-        ctx->last_result = result;
-
-        if (copy_to_user(argp, &result, sizeof(result)))
-            return -EFAULT;
-        break;
-    }
-
-    default:
-        return -ENOTTY;
-    }
-
-    return ret;
 }
 
 static const struct file_operations pagewalk_fops = {
@@ -506,18 +259,24 @@ static struct miscdevice pagewalk_misc = {
     .mode  = 0666,
 };
 
+/*
+ * Module init/exit
+ */
 static int __init pagewalk_init(void)
 {
     int ret;
 
     ret = misc_register(&pagewalk_misc);
     if (ret) {
-        pr_err(DRIVER_NAME ": failed to register misc device: %d\n", ret);
+        pr_err(DRIVER_NAME ": failed to register device: %d\n", ret);
         return ret;
     }
 
+    /* Enable cycle counter at module load */
+    enable_cycle_counter();
+
     pr_info(DRIVER_NAME " v" DRIVER_VERSION " loaded\n");
-    pr_info(DRIVER_NAME ": device created at /dev/%s\n", PAGEWALK_DEVICE_NAME);
+    pr_info(DRIVER_NAME ": device at /dev/%s\n", PAGEWALK_DEVICE_NAME);
     
     return 0;
 }
@@ -533,5 +292,5 @@ module_exit(pagewalk_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Pagewalk Timer Project");
-MODULE_DESCRIPTION("Kernel driver for measuring pagewalk timing and interrupt latency");
+MODULE_DESCRIPTION("Precise pagewalk timing measurement using CPU cycle counter");
 MODULE_VERSION(DRIVER_VERSION);
