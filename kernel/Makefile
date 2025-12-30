@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 #
-# Makefile for pagewalk_driver kernel module
+# Makefile for kernel modules
 #
 # For cross-compilation (i.MX8MP), set:
 #   CROSS_COMPILE=aarch64-linux-gnu-
@@ -9,7 +9,7 @@
 # Example: make CROSS_COMPILE=aarch64-linux-gnu- KDIR=/path/to/linux-imx
 #
 
-obj-m := pagewalk_driver.o
+obj-m := pagewalk_driver.o int_latency_driver.o
 
 # Kernel build directory - override with KDIR=/path/to/kernel
 # For cross-compilation, pass KDIR from top-level Makefile

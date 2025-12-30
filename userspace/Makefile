@@ -1,37 +1,31 @@
-# Makefile for pagewalk_test userspace application
+# Makefile for userspace test applications
 
-# Cross-compiler - override with CC=aarch64-poky-linux-gcc
+# Cross-compilation settings
 CC ?= aarch64-poky-linux-gcc
+SYSROOT ?= /opt/fsl-imx-fb/6.6-scarthgap/sysroots/armv8a-poky-linux
 
-# Sysroot for cross-compilation (set via environment or override)
-# Example: SYSROOT=/opt/poky/sysroots/aarch64-poky-linux
-SYSROOT ?=
-
-# Compiler flags
-ifdef SYSROOT
 CFLAGS := -Wall -Wextra -O2 -g -I../include --sysroot=$(SYSROOT)
-LDFLAGS := -static --sysroot=$(SYSROOT)
-else
-CFLAGS := -Wall -Wextra -O2 -g -I../include
-LDFLAGS := -static
-endif
+LDFLAGS := --sysroot=$(SYSROOT)
 
-TARGET := pagewalk_test
-SOURCES := pagewalk_test.c
-OBJECTS := $(SOURCES:.c=.o)
+TARGETS := pagewalk_test int_latency_test
+SOURCES := pagewalk_test.c int_latency_test.c
 
 .PHONY: all clean
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(OBJECTS)
+pagewalk_test: pagewalk_test.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+int_latency_test: int_latency_test.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(TARGET) $(OBJECTS)
+	rm -f $(TARGETS) *.o
 
 # Dependencies
 pagewalk_test.o: pagewalk_test.c ../include/pagewalk_ioctl.h
+int_latency_test.o: int_latency_test.c ../include/int_latency_ioctl.h

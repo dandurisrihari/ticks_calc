@@ -1,9 +1,8 @@
 #!/bin/bash
-# load_module.sh - Load the pagewalk_driver kernel module
+# load_module.sh - Load kernel modules
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODULE_PATH="$SCRIPT_DIR/../kernel/pagewalk_driver.ko"
-MODULE_NAME="pagewalk_driver"
+KERNEL_DIR="$SCRIPT_DIR/../kernel"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -11,40 +10,37 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Check if module file exists
-if [ ! -f "$MODULE_PATH" ]; then
-    echo "Error: Module not found at $MODULE_PATH"
-    echo "Run 'make' in the project root first."
-    exit 1
-fi
+load_module() {
+    local name="$1"
+    local path="$KERNEL_DIR/${name}.ko"
 
-# Check if already loaded
-if lsmod | grep -q "$MODULE_NAME"; then
-    echo "Module $MODULE_NAME is already loaded"
-    exit 0
-fi
-
-# Load the module
-echo "Loading $MODULE_NAME..."
-insmod "$MODULE_PATH"
-
-if [ $? -eq 0 ]; then
-    echo "Module loaded successfully"
-    
-    # Show device info
-    if [ -e /dev/pagewalk_timer ]; then
-        echo "Device created: /dev/pagewalk_timer"
-        ls -la /dev/pagewalk_timer
-    else
-        echo "Warning: Device /dev/pagewalk_timer not found"
+    if [ ! -f "$path" ]; then
+        echo "Warning: $path not found"
+        return 1
     fi
-    
-    # Show dmesg output
-    echo ""
-    echo "Kernel messages:"
-    dmesg | tail -5
-else
-    echo "Failed to load module"
-    dmesg | tail -5
-    exit 1
-fi
+
+    if lsmod | grep -q "^$name"; then
+        echo "$name: already loaded"
+        return 0
+    fi
+
+    echo "Loading $name..."
+    if insmod "$path"; then
+        echo "$name: loaded successfully"
+    else
+        echo "$name: failed to load"
+        return 1
+    fi
+}
+
+# Load both modules
+load_module "pagewalk_driver"
+load_module "int_latency_driver"
+
+echo ""
+echo "Devices:"
+ls -la /dev/pagewalk_timer /dev/int_latency 2>/dev/null || echo "No devices found"
+
+echo ""
+echo "Kernel messages:"
+dmesg | tail -5

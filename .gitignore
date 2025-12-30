@@ -12,6 +12,7 @@ kernel/.tmp_versions/
 # Userspace build artifacts
 userspace/*.o
 userspace/pagewalk_test
+userspace/int_latency_test
 
 # Editor and IDE files
 *.swp
